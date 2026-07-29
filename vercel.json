@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/github-webhook.ts": {
+      "maxDuration": 60
+    }
+  }
+}

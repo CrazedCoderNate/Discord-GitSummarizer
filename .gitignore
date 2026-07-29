@@ -1,0 +1,10 @@
+node_modules
+
+# secrets
+.env
+.env*.local
+.env.vercel
+!.env.example
+
+# vercel (contains projectId / orgId)
+.vercel
