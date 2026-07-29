@@ -153,3 +153,7 @@ Every failure mode degrades instead of dropping the event.
 - More than 10 embeds: Discord caps a message at 10, so they go out in batches.
 
 Errors go to `console.error` and show up in Vercel's function logs.
+
+## License
+
+MIT. See `LICENSE`.
