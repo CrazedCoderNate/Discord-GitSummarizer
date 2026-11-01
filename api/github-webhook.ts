@@ -8,18 +8,19 @@ import { waitUntil } from "@vercel/functions";
 
 const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET!;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL!;
 
-const MODEL = process.env.MODEL ?? "gemini-3.6-flash";
+const MODEL = process.env.MODEL ?? "claude-haiku-5-5";
 const MAX_COMMITS = Number(process.env.MAX_COMMITS_PER_PUSH ?? 5);
 const MAX_DIFF_CHARS = Number(process.env.MAX_DIFF_CHARS ?? 12_000);
 
-// Gemini 3 counts thinking tokens toward this budget, so it needs headroom that
-// a non-thinking model would not. Too low and you get finishReason MAX_TOKENS
-// with an empty parts array.
+// Haiku thinks adaptively and its thinking counts toward max_tokens, so leave
+// headroom. Too low and you get stop_reason "max_tokens" with no usable JSON.
 const MAX_TOKENS = Number(process.env.MAX_TOKENS ?? 1200);
-const THINKING_LEVEL = process.env.THINKING_LEVEL ?? "low";
+// low | medium | high. Controls how much Haiku thinks before answering; a commit
+// summary does not need more than low.
+const EFFORT = process.env.EFFORT ?? "low";
 
 // optional "main,develop" allowlist. empty = every branch
 const BRANCH_FILTER = (process.env.BRANCH_FILTER ?? "")
@@ -79,17 +80,10 @@ interface Explanation {
   risk_note: string;
 }
 
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: { parts?: Array<{ text?: string; thought?: boolean }> };
-    finishReason?: string;
-  }>;
-  promptFeedback?: { blockReason?: string };
-  usageMetadata?: {
-    promptTokenCount?: number;
-    candidatesTokenCount?: number;
-    thoughtsTokenCount?: number;
-  };
+interface ClaudeResponse {
+  content?: Array<{ type: string; text?: string }>;
+  stop_reason?: string;
+  usage?: { input_tokens?: number; output_tokens?: number };
 }
 
 /* ------------------------------------------------------------------ */
@@ -278,35 +272,20 @@ Rules:
 - If the diff is empty or unavailable, infer conservatively from the commit message and say so in a bullet.
 - No emoji. No filler like "this commit". Write like a senior reviewer leaving a note.`;
 
-// Gemini enforces this server-side, so no fence-stripping or prefill tricks needed.
+// Structured outputs: the API constrains decoding to this schema, so the text
+// block is always parseable JSON in this shape. Objects must set
+// additionalProperties: false.
 const RESPONSE_SCHEMA = {
-  type: "OBJECT",
+  type: "object",
   properties: {
-    headline: { type: "STRING" },
-    bullets: { type: "ARRAY", items: { type: "STRING" } },
-    risk: { type: "STRING", enum: ["low", "medium", "high"] },
-    risk_note: { type: "STRING" },
+    headline: { type: "string" },
+    bullets: { type: "array", items: { type: "string" } },
+    risk: { type: "string", enum: ["low", "medium", "high"] },
+    risk_note: { type: "string" },
   },
   required: ["headline", "bullets", "risk", "risk_note"],
-  propertyOrdering: ["headline", "bullets", "risk", "risk_note"],
+  additionalProperties: false,
 };
-
-// Diffs touching auth, exploit handling, or anything that reads as violent out of
-// context can otherwise come back blocked with an empty candidate.
-const SAFETY_SETTINGS = [
-  "HARM_CATEGORY_HARASSMENT",
-  "HARM_CATEGORY_HATE_SPEECH",
-  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-  "HARM_CATEGORY_DANGEROUS_CONTENT",
-].map((category) => ({ category, threshold: "BLOCK_NONE" }));
-
-// thinkingLevel (Gemini 3.x) and thinkingBudget (2.5 and earlier) are mutually
-// exclusive. Sending both is a 400.
-function thinkingConfig() {
-  return /^gemini-3/.test(MODEL)
-    ? { thinkingLevel: THINKING_LEVEL }
-    : { thinkingBudget: 0 };
-}
 
 async function explainCommit(
   commit: PushCommit,
@@ -326,60 +305,56 @@ async function explainCommit(
     .filter(Boolean)
     .join("\n");
 
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${encodeURIComponent(MODEL)}:generateContent`;
-
   try {
-    const res = await fetch(url, {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
       },
+      // no temperature: current Claude models reject sampling params alongside thinking
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [{ role: "user", parts: [{ text: userContent }] }],
-        safetySettings: SAFETY_SETTINGS,
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: MAX_TOKENS,
-          responseMimeType: "application/json",
-          responseSchema: RESPONSE_SCHEMA,
-          thinkingConfig: thinkingConfig(),
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userContent }],
+        output_config: {
+          effort: EFFORT,
+          format: { type: "json_schema", schema: RESPONSE_SCHEMA },
         },
       }),
     });
 
     if (!res.ok) {
-      console.error(`gemini ${res.status}: ${await res.text()}`);
+      console.error(`claude ${res.status}: ${await res.text()}`);
       return fallback(commit);
     }
 
-    const data = (await res.json()) as GeminiResponse;
+    const data = (await res.json()) as ClaudeResponse;
 
-    if (data.promptFeedback?.blockReason) {
-      console.error(`gemini blocked prompt: ${data.promptFeedback.blockReason}`);
-      return fallback(commit);
-    }
-
-    // thinking tokens bill at output rates, so surface them in the logs
-    const u = data.usageMetadata;
+    const u = data.usage;
     if (u) {
       console.log(
-        `gemini tokens in=${u.promptTokenCount ?? 0} out=${u.candidatesTokenCount ?? 0} ` +
-          `thoughts=${u.thoughtsTokenCount ?? 0} sha=${commit.id.slice(0, 7)}`,
+        `claude tokens in=${u.input_tokens ?? 0} out=${u.output_tokens ?? 0} ` +
+          `stop=${data.stop_reason} sha=${commit.id.slice(0, 7)}`,
       );
     }
 
-    const candidate = data.candidates?.[0];
-    const text = (candidate?.content?.parts ?? [])
-      .filter((part) => typeof part.text === "string" && !part.thought)
-      .map((part) => part.text)
+    // a refusal or a cut-off answer can break the schema; fall back rather than guess
+    if (data.stop_reason === "refusal" || data.stop_reason === "max_tokens") {
+      console.error(`claude stop_reason=${data.stop_reason}`);
+      return fallback(commit);
+    }
+
+    // thinking blocks come first; only the text block carries the JSON
+    const text = (data.content ?? [])
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
       .join("");
 
     if (!text) {
-      console.error(`gemini empty response, finishReason=${candidate?.finishReason}`);
+      console.error(`claude empty response, stop_reason=${data.stop_reason}`);
       return fallback(commit);
     }
 
@@ -392,9 +367,9 @@ async function explainCommit(
 
 
 function normalize(raw: Partial<Explanation>): Explanation {
-  const risk: Risk = ["low", "medium", "high"].includes(raw.risk as string)
-    ? (raw.risk as Risk)
-    : "low";
+  // structured outputs do not guarantee enum casing, so compare case-insensitively
+  const r = String(raw.risk ?? "").toLowerCase();
+  const risk: Risk = ["low", "medium", "high"].includes(r) ? (r as Risk) : "low";
   return {
     headline: String(raw.headline ?? "").slice(0, 200) || "No summary available",
     bullets: (Array.isArray(raw.bullets) ? raw.bullets : []).slice(0, 4).map(String),

@@ -1,5 +1,5 @@
 /**
- * Runs the full pipeline against stubbed GitHub / Gemini / Discord endpoints.
+ * Runs the full pipeline against stubbed GitHub / Anthropic / Discord endpoints.
  *
  *   npx tsx test/smoke.ts
  *
@@ -9,13 +9,14 @@ import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 
 process.env.GITHUB_WEBHOOK_SECRET = "testsecret";
-process.env.GEMINI_API_KEY = "test-key";
+process.env.ANTHROPIC_API_KEY = "test-key";
 process.env.DISCORD_WEBHOOK_URL = "https://discord.test/webhook";
 
 const SECRET = "testsecret";
 
 const posted: any[] = [];
-const geminiRequests: any[] = [];
+const claudeRequests: any[] = [];
+let claudeRefuses = false;
 const realFetch = globalThis.fetch;
 
 globalThis.fetch = (async (url: any, init: any) => {
@@ -30,38 +31,35 @@ globalThis.fetch = (async (url: any, init: any) => {
     );
   }
 
-  if (u.includes("generativelanguage.googleapis.com")) {
-    geminiRequests.push({ url: u, body: JSON.parse(init.body) });
+  if (u.includes("api.anthropic.com")) {
+    claudeRequests.push({ url: u, headers: init.headers, body: JSON.parse(init.body) });
+    if (claudeRefuses) {
+      return new Response(
+        JSON.stringify({ stop_reason: "refusal", content: [{ type: "text", text: "I can't help with that." }] }),
+        { status: 200 },
+      );
+    }
     return new Response(
       JSON.stringify({
-        candidates: [
+        stop_reason: "end_turn",
+        content: [
+          { type: "thinking", thinking: "let me look at this diff", signature: "x" },
           {
-            finishReason: "STOP",
-            content: {
-              parts: [
-                { text: "let me look at this diff", thought: true },
-                {
-                  text: JSON.stringify({
-                    headline: "Tightens JWT verification with clock-skew bounds",
-                    bullets: [
-                      "verify() swapped for verifyStrict() in src/auth.ts",
-                      "Adds a 30s clock skew allowance, so slightly-early tokens now pass",
-                    ],
-                    risk: "high",
-                    risk_note: "Touches token validation on every authenticated request.",
-                  }),
-                },
+            type: "text",
+            text: JSON.stringify({
+              headline: "Tightens JWT verification with clock-skew bounds",
+              bullets: [
+                "verify() swapped for verifyStrict() in src/auth.ts",
+                "Adds a 30s clock skew allowance, so slightly-early tokens now pass",
               ],
-            },
+              risk: "High",
+              risk_note: "Touches token validation on every authenticated request.",
+            }),
           },
         ],
-        usageMetadata: {
-          promptTokenCount: 812,
-          candidatesTokenCount: 96,
-          thoughtsTokenCount: 141,
-        },
+        usage: { input_tokens: 812, output_tokens: 96 },
       }),
-      { status: 200, headers: { "content-type": "application/json" } },
+      { status: 200 },
     );
   }
 
@@ -169,27 +167,39 @@ check("push acked fast", ok.statusCode === 202, `got ${ok.statusCode}`);
 // The handler hands the pipeline to waitUntil(), which there is no way to await
 // from here, so drive it directly and ignore whatever the calls above captured.
 posted.length = 0;
-geminiRequests.length = 0;
+claudeRequests.length = 0;
 await processPush(payload as any);
 
 const embed = posted[0]?.embeds?.[0];
-const gemini = geminiRequests[0];
-const prompt = gemini?.body?.contents?.[0]?.parts?.[0]?.text ?? "";
-const gc = gemini?.body?.generationConfig ?? {};
+const claude = claudeRequests[0];
+const prompt = claude?.body?.messages?.[0]?.content ?? "";
+const oc = claude?.body?.output_config ?? {};
 
 check("discord received one embed", !!embed);
 check("headline in embed", !!embed?.description?.includes("clock-skew"));
-check("risk color is red", embed?.color === 0xf85149, String(embed?.color));
+check("risk color is red (mixed-case enum normalized)", embed?.color === 0xf85149, String(embed?.color));
 check("risk note rendered", !!embed?.description?.includes("HIGH RISK"));
 check("lockfile stripped from diff", !prompt.includes("package-lock"));
-check("thought part excluded from output", !embed?.description?.includes("let me look"));
-check("systemInstruction sent", !!gemini?.body?.systemInstruction);
-check("responseSchema sent", !!gc.responseSchema && gc.responseMimeType === "application/json");
+check("thinking block excluded from output", !embed?.description?.includes("let me look"));
+check("haiku model requested", claude?.body?.model === "claude-haiku-5-5", claude?.body?.model);
+check("system prompt sent", typeof claude?.body?.system === "string" && claude.body.system.length > 0);
+check("api key + version headers", claude?.headers?.["x-api-key"] === "test-key" && !!claude?.headers?.["anthropic-version"]);
 check(
-  "thinking fields mutually exclusive",
-  !("thinkingLevel" in (gc.thinkingConfig ?? {}) && "thinkingBudget" in (gc.thinkingConfig ?? {})),
-  JSON.stringify(gc.thinkingConfig),
+  "json schema sent",
+  oc.format?.type === "json_schema" && oc.format?.schema?.additionalProperties === false,
 );
+check("no temperature sent", !("temperature" in (claude?.body ?? {})));
+
+// a refusal must fall back to the raw commit message, not post the refusal text
+const firstPayload = posted[0];
+posted.length = 0;
+claudeRefuses = true;
+await processPush(payload as any);
+claudeRefuses = false;
+const refused = posted[0]?.embeds?.[0];
+check("refusal falls back to commit message", !!refused?.description?.includes("harden token check") && !refused?.description?.includes("can't help"));
+posted.length = 0;
+posted.push(firstPayload);
 
 console.log("\n--- discord payload ---");
 console.log(JSON.stringify(posted[0], null, 2));

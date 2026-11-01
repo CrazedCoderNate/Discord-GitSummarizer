@@ -5,7 +5,7 @@ Github Webhook to summarize commits in laymen terms and automatically push to a 
 ```
 GitHub push --> /api/github-webhook --> 202 ack (immediately)
                         |
-                        +-- background: fetch diff --> Gemini --> Discord embed
+                        +-- background: fetch diff --> Claude Haiku --> Discord embed
 ```
 
 It is one Vercel serverless function. There is no database, no queue, and no state to manage.
@@ -79,31 +79,22 @@ For private repos you also need `GITHUB_TOKEN`, a fine-grained PAT with `Content
 
 ## Cost and model choice
 
-Default is `gemini-3.6-flash` at $1.50 input / $7.50 output per million tokens. With `MAX_DIFF_CHARS=12000` a commit runs roughly 3k input plus 100 output plus 150 thinking tokens, so about **$0.006 per commit**.
-This will depend on the size of your commits. I personally like to do more modular commits, so my costs are averaging around $0.003 per commit.
+Default is `claude-haiku-5-5` at $0.10 input / $0.50 output per million tokens (for prompts under 100k tokens, which every commit here is). With `MAX_DIFF_CHARS=12000` a commit runs roughly 4k input plus a few hundred output and thinking tokens, so about **$0.0005 per commit**. Haiku's tokenizer counts the same text as roughly 30% more tokens than older Claude models, which is already in that estimate.
+This will depend on the size of your commits.
 
-The Flash ladder, cheapest first:
+Summarizing a commit is squarely a Haiku task. If you want richer summaries on big diffs, `MODEL=claude-sonnet-5-5` ($2 / $10) works with no code change, at about 20x the cost.
 
-| Model | Input / Output per MTok | Notes |
-|---|---|---|
-| `gemini-2.5-flash-lite` | $0.10 / $0.40 | Absolute floor, but Google retires it 16 Oct 2026 |
-| `gemini-3.1-flash-lite` | $0.25 / $1.50 | The cheap option worth actually building on |
-| `gemini-3-flash` | $0.50 / $3.00 | Middle ground |
-| `gemini-3.6-flash` | $1.50 / $7.50 | Default here, launched 21 Jul 2026 |
-
-Summarizing a commit is squarely a Flash-Lite task. `gemini-3.1-flash-lite` costs a sixth of the default and will produce near-identical output on this prompt, so set `MODEL=gemini-3.1-flash-lite` unless you find the summaries thin.
-
-**Thinking tokens bill at output rates.** This is the line item that surprises people. Gemini 3.x thinks by default and those tokens land on the output meter, which is why `THINKING_LEVEL=low` and `MAX_TOKENS=1200` are the defaults. Set `MAX_TOKENS` too low and the model burns the whole budget thinking, then returns `finishReason: MAX_TOKENS` with an empty parts array and you get a fallback message with no error to explain it. The handler logs `thoughts=` on every call so you can watch the real ratio instead of guessing.
+**Thinking tokens bill at output rates.** Haiku thinks adaptively and those tokens land on the output meter and count toward `max_tokens`, which is why `EFFORT=low` and `MAX_TOKENS=1200` are the defaults. Set `MAX_TOKENS` too low and the answer is cut off with `stop_reason: "max_tokens"`, and you get a fallback message. The handler logs `in=`, `out=` and `stop=` on every call so you can watch the real numbers instead of guessing.
 
 Other levers: lower `MAX_DIFF_CHARS`, set `BRANCH_FILTER=main` so feature-branch churn never reaches the API, or drop `MAX_COMMITS_PER_PUSH` to 3.
 
-## Free tier warning
+## Data use
 
-Gemini's Flash models have a standing free tier and it is tempting. Content sent on the free tier is used to improve Google's products. Do not point this at a private repo on a free-tier key. Enable billing on the project so requests bill against the paid tier before you connect anything proprietary. Worth noting.
+Anthropic does not train on API traffic by default, so pointing this at a private repo is fine on a normal API key. There is no free tier to worry about.
 
 ## Configuration
 
-All of it is environment variables, documented in `.env.example`. Required: `GITHUB_WEBHOOK_SECRET`, `GEMINI_API_KEY`, `DISCORD_WEBHOOK_URL`. Required for private repos: `GITHUB_TOKEN`. Everything else is tuning and has a sane default.
+All of it is environment variables, documented in `.env.example`. Required: `GITHUB_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, `DISCORD_WEBHOOK_URL`. Required for private repos: `GITHUB_TOKEN`. Everything else is tuning and has a sane default.
 
 ## Test locally
 
@@ -113,7 +104,7 @@ npm run typecheck
 npm test
 ```
 
-`npm test` runs the whole pipeline against stubbed GitHub, Gemini, and Discord endpoints. No network calls and no real API keys, so it is safe to run anywhere. It checks the handler contract (bad signature, ping, non-push events, non-POST, fast ack) and then drives the background half directly and asserts on what actually reached Discord.
+`npm test` runs the whole pipeline against stubbed GitHub, Anthropic, and Discord endpoints. No network calls and no real API keys, so it is safe to run anywhere. It checks the handler contract (bad signature, ping, non-push events, non-POST, fast ack) and then drives the background half directly and asserts on what actually reached Discord.
 
 `processPush` is exported for that reason. `waitUntil()` is a no-op outside the Vercel runtime, so there is no way to await the background work from a test without it.
 
@@ -134,14 +125,15 @@ Grab a real `sample-push.json` from the Recent Deliveries tab on the GitHub webh
 
 ## Tuning the output
 
-The prompt lives in `SYSTEM_PROMPT`. The JSON shape is enforced server-side by `responseSchema` with `responseMimeType: "application/json"`, so there is no fence-stripping or parse-retry logic to maintain.
+The prompt lives in `SYSTEM_PROMPT`. The JSON shape is enforced server-side by structured outputs (`output_config.format` with a JSON schema), so there is no fence-stripping or parse-retry logic to maintain.
 
 The risk rubric is the part worth editing first, since what counts as high risk is specific to your codebase. Right now it treats auth, secrets, permissions, data deletion, schema migrations, and infra changes as high. If you want a role ping on high risk commits, add `content: "<@&ROLE_ID>"` alongside `embeds` in `postToDiscord` when any embed in the batch came back high.
 
-Two Gemini-specific details in `explainCommit` worth not breaking:
+Three Claude-specific details in `explainCommit` worth not breaking:
 
-- `thinkingLevel` (Gemini 3.x) and `thinkingBudget` (2.5 and earlier) cannot both be sent. Doing so is a 400. `thinkingConfig()` picks one based on the model name, so changing `MODEL` across generations does not need a code edit.
-- `safetySettings` are set to `BLOCK_NONE` on all four categories. Diffs touching auth, exploit handling, or anything that reads as violent out of context otherwise come back as an empty candidate with no useful error.
+- No `temperature`. Current Claude models with adaptive thinking reject sampling parameters, so sending one is a 400.
+- The schema sets `additionalProperties: false`. Structured outputs require it on every object.
+- Enum casing is not guaranteed by structured outputs (`"High"` can come back for `"high"`), so `normalize()` lowercases `risk` before checking it.
 
 ## Failure behavior
 
@@ -149,7 +141,7 @@ Every failure mode degrades instead of dropping the event.
 
 - Bad signature: 401, nothing runs.
 - Diff fetch fails: empty diff, and the model summarizes from the commit message alone and says so in a bullet.
-- Gemini errors, blocks the prompt, or returns an empty candidate: falls back to the raw commit message.
+- Claude errors, refuses, runs out of `max_tokens`, or returns no text: falls back to the raw commit message.
 - Discord 429: retries up to 3 times honoring `retry_after`.
 - More than 10 embeds: Discord caps a message at 10, so they go out in batches.
 
